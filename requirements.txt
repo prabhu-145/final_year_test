@@ -1,0 +1,4 @@
+opencv-python
+pillow
+facenet-pytorch
+numpy
