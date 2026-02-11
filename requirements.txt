@@ -1,4 +1,5 @@
+Flask
+deepface
 opencv-python
-pillow
-facenet-pytorch
 numpy
+Pillow
