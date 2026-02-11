@@ -1,160 +1,212 @@
-import streamlit as st
+from __future__ import annotations
+
+import base64
+import uuid
+from pathlib import Path
+from typing import Dict, List
+
 import numpy as np
-import cv2
-import os
-import matplotlib.pyplot as plt
-from src.models.embedder import FaceEmbedder
-
-# ---------------- CONFIG ----------------
-GALLERY_PATH = "data/gallery/gallery_embeddings.npy"
-GALLERY_IMG_DIR = "data/gallery/photos"
-TOP_K = 5
-THRESHOLD = 0.30
-
-st.set_page_config(
-    page_title="Third‑Eye | Forensic Sketch Recognition",
-    layout="wide",
+from flask import (
+    Flask,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
 )
+from werkzeug.utils import secure_filename
 
-# ---------------- CUSTOM CSS ----------------
-st.markdown("""
-<style>
-body {
-    background-color: #0f172a;
-}
-.main {
-    background-color: #0f172a;
-    color: white;
-}
-h1, h2, h3, h4 {
-    color: #e5e7eb;
-}
-.card {
-    background: rgba(255,255,255,0.06);
-    padding: 20px;
-    border-radius: 16px;
-    margin-bottom: 20px;
-}
-.best {
-    border: 2px solid #22c55e;
-    box-shadow: 0 0 20px rgba(34,197,94,0.4);
-}
-.sidebar .sidebar-content {
-    background-color: #020617;
-}
-.stButton>button {
-    background: linear-gradient(90deg,#6366f1,#22c55e);
-    color: white;
-    border-radius: 12px;
-    height: 3em;
-}
-</style>
-""", unsafe_allow_html=True)
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+UPLOAD_DIR = STATIC_DIR / "uploads"
+SAVED_SKETCH_DIR = STATIC_DIR / "saved_sketches"
+DATABASE_DIR = STATIC_DIR / "database"
+PARTS_DIR = STATIC_DIR / "parts"
 
-# ---------------- HEADER ----------------
-st.markdown("""
-<div class="card">
-<h1 style="text-align:center;">🕵️ Third‑Eye</h1>
-<h3 style="text-align:center;color:#9ca3af;">
-AI‑Based Forensic Sketch Recognition System
-</h3>
-</div>
-""", unsafe_allow_html=True)
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+MODEL_NAME = "ArcFace"
+TOP_K = 5
 
-# ---------------- SIDEBAR ----------------
-st.sidebar.title("⚙️ Controls")
-top_k = st.sidebar.slider("Top‑K Matches", 1, 10, TOP_K)
-threshold = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, THRESHOLD)
+app = Flask(__name__)
+app.secret_key = "forensic-sketch-secret"
 
-st.sidebar.markdown("""
----
-### 🧠 Tech Stack
-- Deep Learning
-- InsightFace
-- Cosine Similarity
-- OpenCV
-""")
+for path in [UPLOAD_DIR, SAVED_SKETCH_DIR, DATABASE_DIR]:
+    path.mkdir(parents=True, exist_ok=True)
 
-# ---------------- MAIN ----------------
-col1, col2 = st.columns([1, 2])
 
-with col1:
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("📤 Upload Sketch / Face")
-    uploaded_file = st.file_uploader(
-        "Choose an image",
-        type=["jpg", "png", "jpeg"]
-    )
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-    if uploaded_file:
-        with open("temp.jpg", "wb") as f:
-            f.write(uploaded_file.read())
-        st.image("temp.jpg", caption="Query Image", use_column_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- PROCESS ----------------
-if uploaded_file:
-    embedder = FaceEmbedder()
-    gallery = np.load(GALLERY_PATH, allow_pickle=True).item()
+def list_parts() -> Dict[str, List[str]]:
+    categories: Dict[str, List[str]] = {}
+    if not PARTS_DIR.exists():
+        return categories
 
-    query_emb = embedder.get_embedding("temp.jpg")
+    for category_dir in sorted([p for p in PARTS_DIR.iterdir() if p.is_dir()]):
+        files = []
+        for image_file in sorted(category_dir.iterdir()):
+            if image_file.suffix.lower().lstrip(".") in ALLOWED_EXTENSIONS:
+                files.append(f"parts/{category_dir.name}/{image_file.name}")
+        categories[category_dir.name] = files
+    return categories
 
-    with col2:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader("🔍 Matching Results")
 
-        if query_emb is None:
-            st.error("❌ No face detected in uploaded image")
-        else:
-            scores = []
-            for name, emb in gallery.items():
-                sim = np.dot(query_emb, emb) / (
-                    np.linalg.norm(query_emb) * np.linalg.norm(emb)
-                )
-                scores.append((name, sim))
+def preprocess_image(image_path: Path) -> np.ndarray | None:
+    try:
+        import cv2
+    except Exception:
+        return None
 
-            scores.sort(key=lambda x: x[1], reverse=True)
-            best_score = scores[0][1]
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return None
+    resized = cv2.resize(image, (224, 224))
+    return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
-            if best_score < threshold:
-                st.warning("⚠️ No confident match found")
-            else:
-                # Best match
-                best_img = cv2.imread(
-                    os.path.join(GALLERY_IMG_DIR, scores[0][0])
-                )
-                best_img = cv2.cvtColor(best_img, cv2.COLOR_BGR2RGB)
 
-                st.markdown("<div class='card best'>", unsafe_allow_html=True)
-                st.markdown("### 🏆 Best Match")
-                st.image(
-                    best_img,
-                    caption=f"{scores[0][0]} | Similarity: {best_score:.3f}",
-                    width=280
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
+def compute_embedding(image_path: Path) -> np.ndarray | None:
+    processed_image = preprocess_image(image_path)
+    if processed_image is None:
+        return None
 
-                # Top‑K list
-                st.markdown("### 📊 Top‑K Matches")
-                for i, (name, score) in enumerate(scores[:top_k], 1):
-                    st.write(f"**{i}. {name}** — `{score:.3f}`")
+    try:
+        from deepface import DeepFace
 
-                # Chart
-                names = [x[0] for x in scores[:top_k]]
-                values = [x[1] for x in scores[:top_k]]
+        representation = DeepFace.represent(
+            img_path=processed_image,
+            model_name=MODEL_NAME,
+            detector_backend="opencv",
+            enforce_detection=False,
+        )
+    except Exception:
+        return None
 
-                fig, ax = plt.subplots()
-                ax.barh(names[::-1], values[::-1], color="#6366f1")
-                ax.set_xlabel("Cosine Similarity")
-                ax.set_xlim(0, 1)
+    if not representation:
+        return None
 
-                st.pyplot(fig)
+    return np.array(representation[0]["embedding"], dtype=np.float32)
 
-        st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- FOOTER ----------------
-st.markdown("""
-<p style="text-align:center;color:#9ca3af;">
-Third‑Eye | Final Year Project | Forensic AI
-</p>
-""", unsafe_allow_html=True)
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    denominator = np.linalg.norm(a) * np.linalg.norm(b)
+    if denominator == 0:
+        return 0.0
+    return float(np.dot(a, b) / denominator)
+
+
+def build_database_embeddings() -> Dict[str, np.ndarray]:
+    embeddings: Dict[str, np.ndarray] = {}
+    for image_path in sorted(DATABASE_DIR.iterdir() if DATABASE_DIR.exists() else []):
+        if image_path.suffix.lower().lstrip(".") not in ALLOWED_EXTENSIONS:
+            continue
+        embedding = compute_embedding(image_path)
+        if embedding is not None:
+            embeddings[image_path.name] = embedding
+    return embeddings
+
+
+DATABASE_EMBEDDINGS = build_database_embeddings()
+
+
+@app.route("/")
+def splash() -> str:
+    return render_template("splash.html")
+
+
+@app.route("/dashboard")
+def dashboard() -> str:
+    return render_template("dashboard.html")
+
+
+@app.route("/api/parts")
+def parts_api():
+    return jsonify(list_parts())
+
+
+@app.route("/upload")
+def upload_page() -> str:
+    return render_template("upload.html")
+
+
+@app.route("/save_sketch", methods=["POST"])
+def save_sketch():
+    data = request.get_json(silent=True) or {}
+    image_data = data.get("image")
+
+    if not image_data or not image_data.startswith("data:image/png;base64,"):
+        return jsonify({"error": "Invalid sketch data"}), 400
+
+    encoded = image_data.split(",", 1)[1]
+    try:
+        decoded_image = base64.b64decode(encoded)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid base64 payload"}), 400
+
+    filename = f"sketch_{uuid.uuid4().hex}.png"
+    save_path = SAVED_SKETCH_DIR / filename
+    save_path.write_bytes(decoded_image)
+
+    return jsonify({"filename": filename, "url": url_for("static", filename=f"saved_sketches/{filename}")})
+
+
+@app.route("/recognize", methods=["POST"])
+def recognize():
+    upload_file = request.files.get("sketch")
+
+    if upload_file is None or upload_file.filename == "":
+        flash("Please upload a sketch image.", "error")
+        return redirect(url_for("upload_page"))
+
+    if not allowed_file(upload_file.filename):
+        flash("Only PNG, JPG, and JPEG files are allowed.", "error")
+        return redirect(url_for("upload_page"))
+
+    safe_name = secure_filename(upload_file.filename)
+    filename = f"{uuid.uuid4().hex}_{safe_name}"
+    upload_path = UPLOAD_DIR / filename
+    upload_file.save(upload_path)
+
+    query_embedding = compute_embedding(upload_path)
+    if query_embedding is None:
+        flash("No recognizable face features found in the uploaded sketch.", "error")
+        return redirect(url_for("upload_page"))
+
+    if not DATABASE_EMBEDDINGS:
+        flash("Face database is empty. Add images to static/database.", "error")
+        return redirect(url_for("upload_page"))
+
+    scored_matches = []
+    for db_filename, db_embedding in DATABASE_EMBEDDINGS.items():
+        similarity = cosine_similarity(query_embedding, db_embedding)
+        scored_matches.append(
+            {
+                "filename": db_filename,
+                "similarity": similarity,
+                "confidence": round(similarity * 100, 2),
+                "url": url_for("static", filename=f"database/{db_filename}"),
+            }
+        )
+
+    top_matches = sorted(scored_matches, key=lambda x: x["similarity"], reverse=True)[:TOP_K]
+
+    session["result"] = {
+        "query_url": url_for("static", filename=f"uploads/{filename}"),
+        "matches": top_matches,
+    }
+
+    return redirect(url_for("result"))
+
+
+@app.route("/result")
+def result():
+    payload = session.get("result")
+    if not payload:
+        return redirect(url_for("upload_page"))
+    return render_template("result.html", query_url=payload["query_url"], matches=payload["matches"])
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
